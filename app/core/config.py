@@ -1,7 +1,8 @@
-from typing import List, Union, Optional
-from pydantic import field_validator
+from typing import List, Union
+from pydantic import AnyHttpUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import json
+import os
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "Smart Todo Hub API"
@@ -27,12 +28,12 @@ class Settings(BaseSettings):
                 return v.replace("postgresql://", "postgresql+asyncpg://", 1)
         return v
 
-    # Google OAuth (Loaded automatically from .env or environment variables)
-    GOOGLE_CLIENT_ID: Optional[str] = None
-    GOOGLE_CLIENT_SECRET: Optional[str] = None
+    # Google OAuth
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
-    # Resend API (Loaded automatically from .env or environment variables)
-    RESEND_API_KEY: Optional[str] = None
+    # Resend API
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY")
     EMAIL_FROM: str = "Smart Todo App <onboarding@resend.dev>"
 
     # CORS
@@ -55,3 +56,4 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 settings = Settings()
+
