@@ -49,6 +49,8 @@ class TodoUpdate(BaseModel):
     due_date: Optional[datetime] = None
     reminder_time: Optional[datetime] = None
     is_reminder_sent: Optional[bool] = None
+    subtasks: Optional[List[SubtaskCreate]] = None
+
 
 
 class TodoStatusUpdate(BaseModel):

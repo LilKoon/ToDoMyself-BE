@@ -231,6 +231,8 @@ async def update_todo(
         todo.status = todo_update.status
     if todo_update.category is not None:
         todo.category = todo_update.category
+    if todo_update.start_date is not None:
+        todo.start_date = todo_update.start_date
     if todo_update.due_date is not None:
         todo.due_date = todo_update.due_date
     if todo_update.reminder_time is not None:
@@ -239,9 +241,26 @@ async def update_todo(
     if todo_update.is_reminder_sent is not None:
         todo.is_reminder_sent = todo_update.is_reminder_sent
 
+    # Synchronize subtasks if provided
+    if todo_update.subtasks is not None:
+        from sqlalchemy import delete
+        await db.execute(delete(Subtask).where(Subtask.todo_id == todo.id))
+        for idx, s in enumerate(todo_update.subtasks):
+            subtask = Subtask(
+                todo_id=todo.id,
+                title=s.title,
+                is_completed=s.is_completed,
+                order_index=s.order_index if s.order_index else idx
+            )
+            db.add(subtask)
+
     await db.commit()
-    await db.refresh(todo)
-    return todo
+    
+    # Reload with fresh subtasks
+    stmt = select(Todo).options(selectinload(Todo.subtasks)).where(Todo.id == todo.id)
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
 
 @router.patch("/{todo_id}/status", response_model=TodoOut)
 async def update_todo_status(
