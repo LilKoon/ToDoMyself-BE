@@ -38,8 +38,10 @@ async def init_db():
         from app.models.user import User
         from app.models.todo import Todo, Subtask
         from app.models.notification import UserNotificationSettings, NotificationLog
+        from app.models.otp import EmailOTP
         
         await conn.run_sync(Base.metadata.create_all)
+
 
         # Ensure start_date column exists on existing PostgreSQL/SQLite tables
         try:

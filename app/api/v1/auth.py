@@ -2,6 +2,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from jose import jwt, JWTError
+import secrets
+from datetime import datetime, timezone, timedelta
 
 from app.core.database import get_db
 from app.core.config import settings
@@ -17,16 +19,235 @@ from app.core.security import (
 )
 from app.models.user import User
 from app.models.notification import UserNotificationSettings
+from app.models.otp import EmailOTP
 from app.schemas.user import (
     UserCreate, UserLogin, GoogleAuthRequest, SetPasswordRequest,
     UserUpdate, UserOut, TokenResponse, RefreshTokenRequest
 )
+from app.schemas.otp import SendOTPRequest, VerifyOTPRequest, ResendOTPRequest, OTPResponse
+from app.services.email_service import send_otp_registration_email
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
+@router.post("/register/send-otp", response_model=OTPResponse)
+async def send_register_otp(req: SendOTPRequest, db: AsyncSession = Depends(get_db)):
+    email_clean = req.email.lower().strip()
+
+    # 1. Check if email is already registered in users table
+    res_user = await db.execute(select(User).where(User.email == email_clean))
+    if res_user.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email đã được sử dụng để đăng ký tài khoản. Vui lòng đăng nhập."
+        )
+
+    # 2. Check rate limit (1 minute cooldown between requests)
+    res_otp = await db.execute(
+        select(EmailOTP).where(EmailOTP.email == email_clean).order_by(EmailOTP.created_at.desc())
+    )
+    existing_otp = res_otp.scalars().first()
+    now_utc = datetime.now(timezone.utc)
+
+    if existing_otp:
+        last_sent = existing_otp.last_sent_at
+        if last_sent.tzinfo is None:
+            last_sent = last_sent.replace(tzinfo=timezone.utc)
+        
+        diff_seconds = (now_utc - last_sent).total_seconds()
+        if diff_seconds < 60:
+            remaining = int(60 - diff_seconds)
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Vui lòng đợi thêm {remaining} giây trước khi yêu cầu gửi lại mã OTP."
+            )
+
+    # 3. Generate 6-digit cryptographic OTP code
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    expires_at = now_utc + timedelta(minutes=5)
+
+    # 4. Save/Update OTP record
+    new_otp = EmailOTP(
+        email=email_clean,
+        full_name=req.full_name.strip(),
+        hashed_password=get_password_hash(req.password),
+        otp_code=otp_code,
+        attempts=0,
+        is_used=False,
+        expires_at=expires_at,
+        last_sent_at=now_utc,
+        created_at=now_utc
+    )
+    db.add(new_otp)
+    await db.commit()
+
+    # 5. Send email via Resend
+    await send_otp_registration_email(email_clean, req.full_name.strip(), otp_code)
+
+    return OTPResponse(
+        message=f"Mã OTP xác thực gồm 6 chữ số đã được gửi tới {email_clean}.",
+        cooldown_seconds=60,
+        expires_in_seconds=300
+    )
+
+@router.post("/register/resend-otp", response_model=OTPResponse)
+async def resend_register_otp(req: ResendOTPRequest, db: AsyncSession = Depends(get_db)):
+    email_clean = req.email.lower().strip()
+
+    # 1. Check if user already registered
+    res_user = await db.execute(select(User).where(User.email == email_clean))
+    if res_user.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tài khoản này đã được xác thực và tạo thành công. Vui lòng đăng nhập."
+        )
+
+    # 2. Find latest OTP record
+    res_otp = await db.execute(
+        select(EmailOTP).where(EmailOTP.email == email_clean).order_by(EmailOTP.created_at.desc())
+    )
+    existing_otp = res_otp.scalars().first()
+
+    if not existing_otp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Không tìm thấy thông tin đăng ký. Vui lòng quay lại điền thông tin đăng ký."
+        )
+
+    # 3. Check 60s cooldown
+    now_utc = datetime.now(timezone.utc)
+    last_sent = existing_otp.last_sent_at
+    if last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=timezone.utc)
+
+    diff_seconds = (now_utc - last_sent).total_seconds()
+    if diff_seconds < 60:
+        remaining = int(60 - diff_seconds)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Vui lòng đợi thêm {remaining} giây trước khi gửi lại mã."
+        )
+
+    # 4. Generate new OTP and reset attempts & expiry (5 minutes)
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+    existing_otp.otp_code = otp_code
+    existing_otp.expires_at = now_utc + timedelta(minutes=5)
+    existing_otp.last_sent_at = now_utc
+    existing_otp.attempts = 0
+    existing_otp.is_used = False
+
+    await db.commit()
+
+    # 5. Send email
+    await send_otp_registration_email(email_clean, existing_otp.full_name, otp_code)
+
+    return OTPResponse(
+        message=f"Đã gửi lại mã OTP xác thực tới {email_clean}.",
+        cooldown_seconds=60,
+        expires_in_seconds=300
+    )
+
+@router.post("/register/verify-otp", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+async def verify_register_otp(req: VerifyOTPRequest, db: AsyncSession = Depends(get_db)):
+    email_clean = req.email.lower().strip()
+    otp_input = req.otp_code.strip()
+
+    # 1. Query latest unused OTP record
+    res_otp = await db.execute(
+        select(EmailOTP).where(
+            EmailOTP.email == email_clean,
+            EmailOTP.is_used == False
+        ).order_by(EmailOTP.created_at.desc())
+    )
+    otp_record = res_otp.scalars().first()
+
+    if not otp_record:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Không tìm thấy mã xác thực hợp lệ hoặc mã đã được sử dụng. Vui lòng yêu cầu gửi lại mã."
+        )
+
+    # 2. Check maximum attempts (5 attempts max)
+    if otp_record.attempts >= 5:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Bạn đã nhập sai mã quá 5 lần. Mã OTP này đã bị vô hiệu hóa, vui lòng bấm Gửi lại mã mới."
+        )
+
+    # 3. Check expiration (5 minutes)
+    now_utc = datetime.now(timezone.utc)
+    expires_at = otp_record.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if now_utc > expires_at:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Mã OTP đã hết hạn (chỉ có hiệu lực trong 5 phút). Vui lòng bấm Gửi lại mã mới."
+        )
+
+    # 4. Verify code match
+    if otp_record.otp_code != otp_input:
+        otp_record.attempts += 1
+        await db.commit()
+        remaining_attempts = 5 - otp_record.attempts
+        if remaining_attempts > 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Mã OTP không chính xác. Bạn còn {remaining_attempts} lần thử."
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Mã OTP đã bị khóa do nhập sai quá 5 lần. Vui lòng bấm Gửi lại mã mới."
+            )
+
+    # 5. OTP is Valid! Check if user already exists
+    res_user = await db.execute(select(User).where(User.email == email_clean))
+    if res_user.scalars().first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tài khoản này đã tồn tại. Vui lòng đăng nhập."
+        )
+
+    # 6. Create User & Notification Settings
+    new_user = User(
+        email=email_clean,
+        full_name=otp_record.full_name,
+        hashed_password=otp_record.hashed_password,
+        timezone="Asia/Ho_Chi_Minh",
+        auth_provider="local"
+    )
+    db.add(new_user)
+    await db.flush()
+
+    notif_settings = UserNotificationSettings(
+        user_id=new_user.id,
+        email_notifications_enabled=True,
+        remind_before_minutes=30,
+        daily_summary_enabled=True,
+        daily_summary_time="08:00"
+    )
+    db.add(notif_settings)
+
+    # Mark OTP as used
+    otp_record.is_used = True
+    await db.commit()
+    await db.refresh(new_user)
+
+    access_token = create_access_token(new_user.id)
+    refresh_token = create_refresh_token(new_user.id)
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        needs_password_setup=False,
+        user=UserOut.model_validate(new_user),
+        message="Xác thực email và tạo tài khoản thành công! Chào mừng bạn đến với Smart Todo Hub."
+    )
+
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
-    # Check if email exists
+    # Direct register fallback for backward compatibility
     result = await db.execute(select(User).where(User.email == user_in.email.lower()))
     if result.scalars().first():
         raise HTTPException(
@@ -34,7 +255,6 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
             detail="Email đã được sử dụng. Vui lòng chọn email khác hoặc đăng nhập."
         )
 
-    # Create new user
     new_user = User(
         email=user_in.email.lower(),
         full_name=user_in.full_name,
@@ -46,7 +266,6 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
     db.add(new_user)
     await db.flush()
 
-    # Create default notification settings
     notif_settings = UserNotificationSettings(
         user_id=new_user.id,
         email_notifications_enabled=True,
@@ -68,6 +287,7 @@ async def register(user_in: UserCreate, db: AsyncSession = Depends(get_db)):
         user=UserOut.model_validate(new_user),
         message="Đăng ký tài khoản thành công."
     )
+
 
 @router.post("/login", response_model=TokenResponse)
 async def login(credentials: UserLogin, db: AsyncSession = Depends(get_db)):

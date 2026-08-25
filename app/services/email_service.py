@@ -274,3 +274,46 @@ async def send_test_email(to_email: str, user_name: str) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Failed to send test email to {to_email}: {e}")
         return {"success": False, "error": str(e)}
+
+async def send_otp_registration_email(to_email: str, user_name: str, otp_code: str) -> Dict[str, Any]:
+    """Send 6-digit OTP email for new user registration verification (valid for 5 minutes)"""
+    title = f"🔐 Mã xác thực đăng ký tài khoản của bạn: {otp_code}"
+    preheader = f"Mã xác thực OTP của bạn là {otp_code}. Mã có hiệu lực trong 5 phút."
+    
+    content_html = f"""
+    <p style="font-size: 15px; margin-top: 0;">Xin chào <strong>{user_name}</strong>,</p>
+    <p style="font-size: 14px; color: #475569;">
+      Cảm ơn bạn đã đăng ký tài khoản tại <strong>Smart Todo Hub</strong>. Để hoàn tất quy trình tạo tài khoản, vui lòng nhập mã xác thực OTP 6 chữ số bên dưới:
+    </p>
+    
+    <div style="background: linear-gradient(135deg, #eef2ff 0%, #ede9fe 100%); border: 2px dashed #6366f1; border-radius: 16px; padding: 24px; text-align: center; margin: 24px 0;">
+      <p style="margin: 0 0 8px 0; color: #4f46e5; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;">MÃ XÁC THỰC CỦA BẠN</p>
+      <div style="font-size: 38px; font-weight: 900; letter-spacing: 8px; color: #312e81; font-family: monospace; padding: 8px 0;">
+        {otp_code}
+      </div>
+      <p style="margin: 8px 0 0 0; color: #6b7280; font-size: 12px;">
+        ⏳ Mã này có hiệu lực trong vòng <strong>5 phút</strong>
+      </p>
+    </div>
+    
+    <div style="background: #fffbeb; border: 1px solid #fde68a; border-radius: 12px; padding: 14px 16px; font-size: 13px; color: #92400e; margin-bottom: 20px;">
+      ⚠️ <strong>Lưu ý bảo mật:</strong> Tuyệt đối không chia sẻ mã này cho bất kỳ ai. Nhân viên Smart Todo Hub sẽ không bao giờ yêu cầu cung cấp mã OTP của bạn.
+    </div>
+    """
+    
+    html_content = get_base_email_html("Xác Thực Tài Khoản Smart Todo Hub", preheader, content_html)
+    
+    try:
+        params = {
+            "from": settings.EMAIL_FROM,
+            "to": [to_email],
+            "subject": f"🔐 [Smart Todo] Mã xác thực OTP đăng ký tài khoản ({otp_code})",
+            "html": html_content
+        }
+        response = resend.Emails.send(params)
+        logger.info(f"Registration OTP email sent to {to_email}: {response}")
+        return {"success": True, "response": response}
+    except Exception as e:
+        logger.error(f"Failed to send OTP email to {to_email}: {e}")
+        return {"success": False, "error": str(e)}
+
