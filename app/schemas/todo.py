@@ -31,6 +31,7 @@ class TodoBase(BaseModel):
     priority: PriorityEnum = PriorityEnum.MEDIUM
     status: StatusEnum = StatusEnum.TODO
     category: str = Field("General", max_length=50, description="Danh mục")
+    start_date: Optional[datetime] = None
     due_date: Optional[datetime] = None
     reminder_time: Optional[datetime] = None
 
@@ -44,9 +45,11 @@ class TodoUpdate(BaseModel):
     priority: Optional[PriorityEnum] = None
     status: Optional[StatusEnum] = None
     category: Optional[str] = None
+    start_date: Optional[datetime] = None
     due_date: Optional[datetime] = None
     reminder_time: Optional[datetime] = None
     is_reminder_sent: Optional[bool] = None
+
 
 class TodoStatusUpdate(BaseModel):
     status: StatusEnum

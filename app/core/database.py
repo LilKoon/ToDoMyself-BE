@@ -40,4 +40,13 @@ async def init_db():
         from app.models.notification import UserNotificationSettings, NotificationLog
         
         await conn.run_sync(Base.metadata.create_all)
+
+        # Ensure start_date column exists on existing PostgreSQL/SQLite tables
+        try:
+            from sqlalchemy import text
+            await conn.execute(text("ALTER TABLE todos ADD COLUMN IF NOT EXISTS start_date TIMESTAMPTZ;"))
+        except Exception:
+            pass
+
         logger.info("Database tables initialized successfully.")
+

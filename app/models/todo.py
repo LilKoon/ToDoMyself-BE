@@ -27,9 +27,11 @@ class Todo(Base):
     status = Column(SQLEnum(StatusEnum), default=StatusEnum.TODO, nullable=False, index=True)
     category = Column(String(100), default="General", nullable=False)
     
+    start_date = Column(DateTime(timezone=True), nullable=True)
     due_date = Column(DateTime(timezone=True), nullable=True)
     reminder_time = Column(DateTime(timezone=True), nullable=True)
     is_reminder_sent = Column(Boolean, default=False)
+
     
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
