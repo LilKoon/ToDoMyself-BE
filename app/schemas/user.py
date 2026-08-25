@@ -4,12 +4,13 @@ from datetime import datetime
 
 class UserBase(BaseModel):
     email: EmailStr
-    full_name: str
-    avatar_url: Optional[str] = None
-    timezone: Optional[str] = "Asia/Ho_Chi_Minh"
+    full_name: str = Field(..., min_length=1, max_length=100, description="Họ và tên")
+    avatar_url: Optional[str] = Field(None, max_length=1000)
+    timezone: Optional[str] = Field("Asia/Ho_Chi_Minh", max_length=50)
 
 class UserCreate(UserBase):
-    password: str = Field(..., min_length=6, description="Mật khẩu tối thiểu 6 ký tự")
+    password: str = Field(..., min_length=6, max_length=128, description="Mật khẩu từ 6 đến 128 ký tự")
+
 
 class UserLogin(BaseModel):
     email: EmailStr

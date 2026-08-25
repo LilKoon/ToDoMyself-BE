@@ -53,6 +53,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Set Security Headers Middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
 # Include API Router
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
@@ -75,32 +85,19 @@ async def db_status():
         from sqlalchemy import text
         from app.core.database import AsyncSessionLocal
         
-        # Ensure tables are created
-        await init_db()
-        
         async with AsyncSessionLocal() as session:
             result = await session.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public';"))
             tables = [row[0] for row in result.fetchall()]
-            
-            # Mask password in URL
-            url_str = str(settings.DATABASE_URL)
-            if "@" in url_str:
-                parts = url_str.split("@")
-                proto_user = parts[0].rsplit(":", 1)[0]
-                masked_url = f"{proto_user}:****@{parts[1]}"
-            else:
-                masked_url = url_str
 
             return {
                 "status": "connected",
-                "database_url": masked_url,
                 "tables_count": len(tables),
                 "tables": tables
             }
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e),
-            "database_url": str(settings.DATABASE_URL)
+            "error": "Database connection failed"
         }
+
 
