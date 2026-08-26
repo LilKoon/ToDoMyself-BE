@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     RESEND_API_KEY: Optional[str] = None
     EMAIL_FROM: str = "Smart Todo App <onboarding@resend.dev>"
 
+    # Google Gmail REST API via HTTPS (Port 443 - Recommended for Railway / Cloud)
+    GMAIL_CLIENT_ID: Optional[str] = None
+    GMAIL_CLIENT_SECRET: Optional[str] = None
+    GMAIL_REFRESH_TOKEN: Optional[str] = None
+    GMAIL_SENDER_EMAIL: Optional[str] = None
+
     # SMTP Settings (e.g. Gmail App Password, Custom SMTP)
     SMTP_HOST: str = "smtp.gmail.com"
     SMTP_PORT: int = 465
@@ -42,6 +48,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: Optional[str] = None
     SMTP_FROM: Optional[str] = None
     SMTP_TLS: bool = True
+
 
 
     # CORS

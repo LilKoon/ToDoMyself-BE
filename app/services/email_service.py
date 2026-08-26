@@ -1,4 +1,6 @@
 import logging
+import base64
+import httpx
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from email.mime.multipart import MIMEMultipart
@@ -11,6 +13,91 @@ import resend
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# In-memory access token cache for Gmail API (token, expires_at_timestamp)
+_gmail_token_cache: Dict[str, Any] = {"access_token": None, "expires_at": 0}
+
+async def get_gmail_access_token() -> Optional[str]:
+    """Obtain a fresh OAuth2 access token for Gmail REST API from Google (caching for ~55 min)"""
+    client_id = settings.GMAIL_CLIENT_ID or settings.GOOGLE_CLIENT_ID
+    client_secret = settings.GMAIL_CLIENT_SECRET or settings.GOOGLE_CLIENT_SECRET
+    refresh_token = settings.GMAIL_REFRESH_TOKEN
+
+    if not (client_id and client_secret and refresh_token):
+        return None
+
+    now_ts = datetime.utcnow().timestamp()
+    if _gmail_token_cache["access_token"] and _gmail_token_cache["expires_at"] > (now_ts + 60):
+        return _gmail_token_cache["access_token"]
+
+    token_url = "https://oauth2.googleapis.com/token"
+    payload = {
+        "client_id": client_id.strip(),
+        "client_secret": client_secret.strip(),
+        "refresh_token": refresh_token.strip(),
+        "grant_type": "refresh_token"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(token_url, data=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                acc_token = data.get("access_token")
+                expires_in = data.get("expires_in", 3500)
+                _gmail_token_cache["access_token"] = acc_token
+                _gmail_token_cache["expires_at"] = now_ts + expires_in
+                logger.info("Successfully refreshed Google Gmail REST API OAuth2 access token.")
+                return acc_token
+            else:
+                logger.error(f"Failed to refresh Gmail access token from Google: {resp.status_code} - {resp.text}")
+                return None
+    except Exception as e:
+        logger.error(f"Error requesting Gmail access token: {e}")
+        return None
+
+async def send_via_gmail_api(to_email: str, subject: str, html_content: str) -> Dict[str, Any]:
+    """Send email directly via official Google Gmail REST API (Port 443 HTTPS - Railway Compatible)"""
+    access_token = await get_gmail_access_token()
+    if not access_token:
+        return {
+            "success": False,
+            "error": "Google OAuth2 refresh_token không hợp lệ hoặc thiếu GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN"
+        }
+
+    sender_email = settings.GMAIL_SENDER_EMAIL or settings.SMTP_USER or "me"
+    from_header = settings.SMTP_FROM or formataddr(("Smart Todo Hub", sender_email))
+
+    message = MIMEMultipart("alternative")
+    message["Subject"] = Header(subject, "utf-8")
+    message["From"] = from_header
+    message["To"] = to_email
+
+    html_part = MIMEText(html_content, "html", "utf-8")
+    message.attach(html_part)
+
+    raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    send_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(send_url, json={"raw": raw_message}, headers=headers)
+            if res.status_code in [200, 201]:
+                res_data = res.json()
+                logger.info(f"Email sent successfully via Google Gmail REST API (Port 443) to {to_email}: ID {res_data.get('id')}")
+                return {"success": True, "provider": "gmail_api", "id": res_data.get("id")}
+            else:
+                err_text = f"Gmail REST API error ({res.status_code}): {res.text}"
+                logger.error(err_text)
+                return {"success": False, "error": err_text}
+    except Exception as e:
+        logger.error(f"Failed to connect to Google Gmail REST API: {e}")
+        return {"success": False, "error": str(e)}
 
 # Initialize Resend if key exists
 if settings.RESEND_API_KEY:
@@ -65,10 +152,17 @@ def get_base_email_html(title: str, preheader: str, content_html: str) -> str:
 </html>"""
 
 async def send_email_async(to_email: str, subject: str, html_content: str) -> Dict[str, Any]:
-    """Unified email dispatcher: Prioritizes SMTP (Gmail Port 465 SSL/587) -> Resend API -> Console Fallback"""
-    smtp_errors = []
+    """Unified email dispatcher: Prioritizes Google Gmail REST API (HTTPS Port 443) -> SMTP -> Resend API -> Console Fallback"""
+    # 1. Priority 1: Google Gmail REST API via HTTPS (Port 443 - Perfect for Cloud / Railway)
+    if settings.GMAIL_REFRESH_TOKEN:
+        logger.info(f"Attempting to send email via Google Gmail REST API (HTTPS Port 443) to {to_email}...")
+        gmail_res = await send_via_gmail_api(to_email, subject, html_content)
+        if gmail_res.get("success"):
+            return gmail_res
+        logger.warning(f"Google Gmail REST API failed: {gmail_res.get('error')}. Falling back to secondary providers...")
 
-    # 1. Option A: Send via SMTP (Gmail / Custom SMTP server) if credentials configured
+    # 2. Priority 2: Standard SMTP (Gmail Port 465 SSL/587)
+    smtp_errors = []
     if settings.SMTP_USER and settings.SMTP_PASSWORD:
         from_addr = settings.SMTP_FROM or formataddr(("Smart Todo Hub", settings.SMTP_USER.strip()))
         
@@ -80,11 +174,9 @@ async def send_email_async(to_email: str, subject: str, html_content: str) -> Di
         html_part = MIMEText(html_content, "html", "utf-8")
         message.attach(html_part)
 
-        # Remove spaces in 16-char App Password if user pasted with spaces
         clean_password = settings.SMTP_PASSWORD.replace(" ", "").strip()
         clean_user = settings.SMTP_USER.strip()
 
-        # Determine ports to try: Try configured port first, then alternate port (465 vs 587)
         primary_port = int(settings.SMTP_PORT)
         alt_port = 587 if primary_port == 465 else 465
         ports_to_try = [primary_port, alt_port]
@@ -101,7 +193,7 @@ async def send_email_async(to_email: str, subject: str, html_content: str) -> Di
                     start_tls=not use_direct_ssl,
                     username=clean_user,
                     password=clean_password,
-                    timeout=12
+                    timeout=8
                 )
                 logger.info(f"Email sent successfully via SMTP on port {port} to {to_email}")
                 return {"success": True, "provider": "smtp", "port": port}
@@ -110,9 +202,7 @@ async def send_email_async(to_email: str, subject: str, html_content: str) -> Di
                 logger.warning(f"SMTP error on port {port}: {e}")
                 smtp_errors.append(err_msg)
 
-        logger.error(f"All SMTP ports failed for {to_email}: {'; '.join(smtp_errors)}")
-
-    # 2. Option B: Send via Resend SDK
+    # 3. Priority 3: Send via Resend SDK
     if settings.RESEND_API_KEY:
         try:
             params = {
@@ -130,12 +220,13 @@ async def send_email_async(to_email: str, subject: str, html_content: str) -> Di
             combined_err = f"SMTP errors: {'; '.join(smtp_errors)} | Resend error: {resend_err}" if smtp_errors else resend_err
             return {"success": False, "error": combined_err}
 
-    # 3. Option C: Dev fallback when no email service configured
+    # 4. Fallback: Dev console log if all failed or not configured
     if smtp_errors:
         return {"success": False, "error": f"SMTP failed on all ports: {'; '.join(smtp_errors)}"}
 
     logger.warning(f"No active email provider configured. [DEV EMAIL] To: {to_email} | Subject: {subject}")
     return {"success": True, "provider": "dev_console_log"}
+
 
 
 async def send_task_reminder_email(
