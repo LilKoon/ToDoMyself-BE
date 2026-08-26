@@ -37,11 +37,12 @@ class Settings(BaseSettings):
 
     # SMTP Settings (e.g. Gmail App Password, Custom SMTP)
     SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
+    SMTP_PORT: int = 465
     SMTP_USER: Optional[str] = None
     SMTP_PASSWORD: Optional[str] = None
     SMTP_FROM: Optional[str] = None
     SMTP_TLS: bool = True
+
 
     # CORS
 

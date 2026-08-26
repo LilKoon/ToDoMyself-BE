@@ -65,34 +65,52 @@ def get_base_email_html(title: str, preheader: str, content_html: str) -> str:
 </html>"""
 
 async def send_email_async(to_email: str, subject: str, html_content: str) -> Dict[str, Any]:
-    """Unified email dispatcher: Prioritizes SMTP (Gmail/Custom) -> Resend API -> Console Fallback"""
+    """Unified email dispatcher: Prioritizes SMTP (Gmail Port 465 SSL/587) -> Resend API -> Console Fallback"""
+    smtp_errors = []
+
     # 1. Option A: Send via SMTP (Gmail / Custom SMTP server) if credentials configured
     if settings.SMTP_USER and settings.SMTP_PASSWORD:
-        try:
-            from_addr = settings.SMTP_FROM or formataddr(("Smart Todo Hub", settings.SMTP_USER))
-            
-            message = MIMEMultipart("alternative")
-            message["Subject"] = Header(subject, "utf-8")
-            message["From"] = from_addr
-            message["To"] = to_email
-            
-            html_part = MIMEText(html_content, "html", "utf-8")
-            message.attach(html_part)
+        from_addr = settings.SMTP_FROM or formataddr(("Smart Todo Hub", settings.SMTP_USER.strip()))
+        
+        message = MIMEMultipart("alternative")
+        message["Subject"] = Header(subject, "utf-8")
+        message["From"] = from_addr
+        message["To"] = to_email
+        
+        html_part = MIMEText(html_content, "html", "utf-8")
+        message.attach(html_part)
 
-            await aiosmtplib.send(
-                message,
-                hostname=settings.SMTP_HOST,
-                port=settings.SMTP_PORT,
-                start_tls=settings.SMTP_TLS,
-                username=settings.SMTP_USER,
-                password=settings.SMTP_PASSWORD,
-                timeout=15
-            )
-            logger.info(f"Email sent successfully via SMTP ({settings.SMTP_USER}) to {to_email}")
-            return {"success": True, "provider": "smtp"}
-        except Exception as e:
-            logger.error(f"Failed to send email via SMTP to {to_email}: {e}")
-            # If SMTP fails and Resend is available, fall through to Resend
+        # Remove spaces in 16-char App Password if user pasted with spaces
+        clean_password = settings.SMTP_PASSWORD.replace(" ", "").strip()
+        clean_user = settings.SMTP_USER.strip()
+
+        # Determine ports to try: Try configured port first, then alternate port (465 vs 587)
+        primary_port = int(settings.SMTP_PORT)
+        alt_port = 587 if primary_port == 465 else 465
+        ports_to_try = [primary_port, alt_port]
+
+        for port in ports_to_try:
+            use_direct_ssl = (port == 465)
+            try:
+                logger.info(f"Attempting to send email via SMTP ({clean_user}) on port {port} (use_tls={use_direct_ssl})...")
+                await aiosmtplib.send(
+                    message,
+                    hostname=settings.SMTP_HOST,
+                    port=port,
+                    use_tls=use_direct_ssl,
+                    start_tls=not use_direct_ssl,
+                    username=clean_user,
+                    password=clean_password,
+                    timeout=12
+                )
+                logger.info(f"Email sent successfully via SMTP on port {port} to {to_email}")
+                return {"success": True, "provider": "smtp", "port": port}
+            except Exception as e:
+                err_msg = f"Port {port} failed: {e}"
+                logger.warning(f"SMTP error on port {port}: {e}")
+                smtp_errors.append(err_msg)
+
+        logger.error(f"All SMTP ports failed for {to_email}: {'; '.join(smtp_errors)}")
 
     # 2. Option B: Send via Resend SDK
     if settings.RESEND_API_KEY:
@@ -107,13 +125,18 @@ async def send_email_async(to_email: str, subject: str, html_content: str) -> Di
             logger.info(f"Email sent successfully via Resend API to {to_email}: {response}")
             return {"success": True, "provider": "resend", "response": response}
         except Exception as e:
-            logger.error(f"Failed to send email via Resend to {to_email}: {e}")
-            # If Resend also fails or rejected, log for local dev awareness
-            return {"success": False, "error": str(e)}
+            resend_err = str(e)
+            logger.error(f"Failed to send email via Resend to {to_email}: {resend_err}")
+            combined_err = f"SMTP errors: {'; '.join(smtp_errors)} | Resend error: {resend_err}" if smtp_errors else resend_err
+            return {"success": False, "error": combined_err}
 
     # 3. Option C: Dev fallback when no email service configured
+    if smtp_errors:
+        return {"success": False, "error": f"SMTP failed on all ports: {'; '.join(smtp_errors)}"}
+
     logger.warning(f"No active email provider configured. [DEV EMAIL] To: {to_email} | Subject: {subject}")
     return {"success": True, "provider": "dev_console_log"}
+
 
 async def send_task_reminder_email(
     to_email: str,
