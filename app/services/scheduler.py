@@ -1,12 +1,14 @@
 import pytz
 import logging
 import asyncio
+from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import delete
+
 
 from app.core.database import AsyncSessionLocal
 from app.models.user import User
@@ -61,6 +63,13 @@ async def process_single_task_reminder(
         )
         db.add(log_entry)
 
+def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 async def check_and_send_task_reminders():
     """Job to check individual task reminders every 1 minute with parallel sending"""
     async with AsyncSessionLocal() as db:
@@ -93,20 +102,24 @@ async def check_and_send_task_reminders():
 
                 should_remind = False
 
+                rem_time = to_utc(todo.reminder_time)
+                d_date = to_utc(todo.due_date)
+
                 # Case 1: Specific reminder_time has arrived
-                if todo.reminder_time and todo.reminder_time <= now_utc:
+                if rem_time and rem_time <= now_utc:
                     should_remind = True
                 
                 # Case 2: Due date is approaching based on remind_before_minutes
-                elif todo.due_date:
+                elif d_date:
                     remind_window = now_utc + timedelta(minutes=settings.remind_before_minutes)
-                    if todo.due_date <= remind_window and todo.due_date >= (now_utc - timedelta(hours=2)):
+                    if d_date <= remind_window and d_date >= (now_utc - timedelta(hours=2)):
                         should_remind = True
 
                 if should_remind:
                     tasks_to_execute.append(
                         process_single_task_reminder(sem, todo, user, now_utc, db)
                     )
+
 
             if tasks_to_execute:
                 await asyncio.gather(*tasks_to_execute)
@@ -183,7 +196,7 @@ async def check_and_send_daily_digests():
                 for t in active_todos:
                     if not t.due_date:
                         continue
-                    t_due = t.due_date.astimezone(user_tz)
+                    t_due = to_utc(t.due_date).astimezone(user_tz)
                     t_dict = {
                         "id": t.id,
                         "title": t.title,
@@ -191,6 +204,7 @@ async def check_and_send_daily_digests():
                         "category": t.category,
                         "due_date": t.due_date.isoformat()
                     }
+
                     if t_due < start_of_today_tz:
                         overdue_tasks.append(t_dict)
                     elif start_of_today_tz <= t_due <= end_of_today_tz:

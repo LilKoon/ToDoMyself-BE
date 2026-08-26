@@ -1,12 +1,18 @@
-import resend
+import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.header import Header
+from email.utils import formataddr
+import aiosmtplib
+import resend
+
 from app.core.config import settings
-import logging
 
 logger = logging.getLogger(__name__)
 
-# Initialize Resend
+# Initialize Resend if key exists
 if settings.RESEND_API_KEY:
     resend.api_key = settings.RESEND_API_KEY
 
@@ -58,84 +64,120 @@ def get_base_email_html(title: str, preheader: str, content_html: str) -> str:
 </body>
 </html>"""
 
-def get_priority_badge(priority: str) -> str:
-    p = priority.upper() if priority else "MEDIUM"
-    css_class = {
-        "URGENT": "badge-urgent",
-        "HIGH": "badge-high",
-        "MEDIUM": "badge-medium",
-        "LOW": "badge-low"
-    }.get(p, "badge-medium")
-    return f'<span class="badge {css_class}">{p}</span>'
+async def send_email_async(to_email: str, subject: str, html_content: str) -> Dict[str, Any]:
+    """Unified email dispatcher: Prioritizes SMTP (Gmail/Custom) -> Resend API -> Console Fallback"""
+    # 1. Option A: Send via SMTP (Gmail / Custom SMTP server) if credentials configured
+    if settings.SMTP_USER and settings.SMTP_PASSWORD:
+        try:
+            from_addr = settings.SMTP_FROM or formataddr(("Smart Todo Hub", settings.SMTP_USER))
+            
+            message = MIMEMultipart("alternative")
+            message["Subject"] = Header(subject, "utf-8")
+            message["From"] = from_addr
+            message["To"] = to_email
+            
+            html_part = MIMEText(html_content, "html", "utf-8")
+            message.attach(html_part)
+
+            await aiosmtplib.send(
+                message,
+                hostname=settings.SMTP_HOST,
+                port=settings.SMTP_PORT,
+                start_tls=settings.SMTP_TLS,
+                username=settings.SMTP_USER,
+                password=settings.SMTP_PASSWORD,
+                timeout=15
+            )
+            logger.info(f"Email sent successfully via SMTP ({settings.SMTP_USER}) to {to_email}")
+            return {"success": True, "provider": "smtp"}
+        except Exception as e:
+            logger.error(f"Failed to send email via SMTP to {to_email}: {e}")
+            # If SMTP fails and Resend is available, fall through to Resend
+
+    # 2. Option B: Send via Resend SDK
+    if settings.RESEND_API_KEY:
+        try:
+            params = {
+                "from": settings.EMAIL_FROM,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_content
+            }
+            response = resend.Emails.send(params)
+            logger.info(f"Email sent successfully via Resend API to {to_email}: {response}")
+            return {"success": True, "provider": "resend", "response": response}
+        except Exception as e:
+            logger.error(f"Failed to send email via Resend to {to_email}: {e}")
+            # If Resend also fails or rejected, log for local dev awareness
+            return {"success": False, "error": str(e)}
+
+    # 3. Option C: Dev fallback when no email service configured
+    logger.warning(f"No active email provider configured. [DEV EMAIL] To: {to_email} | Subject: {subject}")
+    return {"success": True, "provider": "dev_console_log"}
 
 async def send_task_reminder_email(
     to_email: str,
     user_name: str,
     todo: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Send single task reminder email"""
-    title = f"⏰ Nhắc nhở công việc: {todo.get('title')}"
-    preheader = f"Bạn có công việc cần làm: {todo.get('title')}"
+    """Send task reminder email before deadline or at scheduled reminder_time"""
+    title = f"⏰ Nhắc nhở: {todo['title']}"
+    preheader = f"Bạn có công việc cần làm: {todo['title']} - Mức độ ưu tiên: {todo.get('priority', 'Trung bình')}"
     
-    due_str = "Không có hạn"
+    priority_badges = {
+        "URGENT": '<span class="badge badge-urgent">Khẩn Cấp</span>',
+        "HIGH": '<span class="badge badge-high">Quan Trọng</span>',
+        "MEDIUM": '<span class="badge badge-medium">Trung Bình</span>',
+        "LOW": '<span class="badge badge-low">Thấp</span>',
+    }
+    badge = priority_badges.get(todo.get("priority", "MEDIUM"), "")
+    
+    due_str = "Không đặt hạn"
     if todo.get("due_date"):
         try:
-            if isinstance(todo["due_date"], str):
-                dt = datetime.fromisoformat(todo["due_date"])
-            else:
-                dt = todo["due_date"]
-            due_str = dt.strftime("%H:%M ngày %d/%m/%Y")
+            dt = datetime.fromisoformat(todo["due_date"].replace("Z", "+00:00"))
+            due_str = dt.strftime("%H:%M • %d/%m/%Y")
         except Exception:
-            due_str = str(todo.get("due_date"))
+            due_str = str(todo["due_date"])
 
     subtasks_html = ""
-    subtasks = todo.get("subtasks", [])
-    if subtasks:
-        items = "".join([f"<li style='margin-bottom:4px; {'text-decoration:line-through;color:#94a3b8;' if s.get('is_completed') else ''}'>{s.get('title')}</li>" for s in subtasks])
+    if todo.get("subtasks"):
+        st_items = "".join([
+            f'<li style="margin: 6px 0; font-size: 13px; color: {"#94a3b8; text-decoration: line-through;" if s.get("is_completed") else "#334155;"}">{"✅" if s.get("is_completed") else "⬜"} {s["title"]}</li>'
+            for s in todo["subtasks"]
+        ])
         subtasks_html = f"""
-        <div style="margin-top: 12px; padding-top: 12px; border-top: 1px dashed #cbd5e1;">
-          <strong style="font-size: 13px; color: #475569;">Danh sách việc con:</strong>
-          <ul style="margin: 6px 0 0 0; padding-left: 20px; font-size: 13px;">
-            {items}
-          </ul>
+        <div style="margin-top: 14px; padding-top: 12px; border-top: 1px dashed #cbd5e1;">
+          <p style="font-size: 12px; font-weight: 700; color: #64748b; text-transform: uppercase; margin: 0 0 6px 0;">Danh sách việc con:</p>
+          <ul style="padding-left: 20px; margin: 0;">{st_items}</ul>
         </div>
         """
 
     content_html = f"""
     <p style="font-size: 15px; margin-top: 0;">Xin chào <strong>{user_name}</strong>,</p>
-    <p style="font-size: 14px; color: #475569;">Đây là thông báo nhắc nhở về công việc đã đến giờ thực hiện của bạn:</p>
+    <p style="font-size: 14px; color: #475569;">Đây là email nhắc nhở tự động từ hệ thống Smart Todo Hub về công việc sắp tới hạn của bạn:</p>
     
     <div class="card" style="border-left: 4px solid #6366f1;">
-      {get_priority_badge(todo.get('priority', 'MEDIUM'))}
-      <div class="task-title">{todo.get('title')}</div>
-      {f'<p class="task-desc">{todo.get("description")}</p>' if todo.get("description") else ''}
-      <div class="meta">
-        <span>📅 Hạn chót: <strong>{due_str}</strong></span>
-        <span>🏷️ Danh mục: <strong>{todo.get('category', 'General')}</strong></span>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <span style="font-size: 12px; color: #64748b; font-weight: 600;">📁 {todo.get('category', 'General')}</span>
+        {badge}
+      </div>
+      <div class="task-title" style="font-size: 18px; color: #1e1b4b;">{todo['title']}</div>
+      <div class="task-desc">{todo.get('description') or 'Không có mô tả chi tiết.'}</div>
+      <div class="meta" style="margin-top: 12px; padding-top: 10px; border-top: 1px solid #f1f5f9;">
+        <span>📅 Hạn hoàn thành: <strong style="color: #0f172a;">{due_str}</strong></span>
       </div>
       {subtasks_html}
     </div>
     
     <div style="text-align: center; margin-top: 24px;">
-      <a href="http://localhost:3000/dashboard" class="btn">Mở Todo Dashboard & Hoàn Thành</a>
+      <a href="http://localhost:3000/dashboard" class="btn">Mở Bảng Công Việc Để Cập Nhật</a>
     </div>
     """
 
     html_content = get_base_email_html(title, preheader, content_html)
-
-    try:
-        params = {
-            "from": settings.EMAIL_FROM,
-            "to": [to_email],
-            "subject": title,
-            "html": html_content
-        }
-        response = resend.Emails.send(params)
-        logger.info(f"Task reminder email sent to {to_email}: {response}")
-        return {"success": True, "response": response}
-    except Exception as e:
-        logger.error(f"Failed to send task reminder email to {to_email}: {e}")
-        return {"success": False, "error": str(e)}
+    subject = f"⏰ [Smart Todo] Nhắc nhở công việc: {todo['title']}"
+    return await send_email_async(to_email, subject, html_content)
 
 async def send_daily_digest_email(
     to_email: str,
@@ -144,54 +186,43 @@ async def send_daily_digest_email(
     today_tasks: List[Dict[str, Any]],
     upcoming_24h_tasks: List[Dict[str, Any]]
 ) -> Dict[str, Any]:
-    """
-    Send daily digest email based on user's custom schedule.
-    Rules:
-    1. Overdue incomplete tasks.
-    2. Today's tasks.
-    3. Upcoming tasks within 1 day (due <= 24h).
-    Tasks > 1 day away are NOT included until they are within 1 day.
-    """
-    title = "🌅 Kế hoạch & Danh sách công việc hôm nay của bạn"
-    preheader = f"Bạn có {len(overdue_tasks) + len(today_tasks) + len(upcoming_24h_tasks)} công việc cần lưu ý hôm nay."
+    """Send morning daily digest summary email"""
+    title = "🌅 Kế Hoạch Công Việc Trong Ngày"
+    preheader = f"Hôm nay bạn có {len(today_tasks)} việc cần làm, {len(overdue_tasks)} việc quá hạn, {len(upcoming_24h_tasks)} việc sắp đến."
 
     def render_task_card(t: Dict[str, Any], border_color: str) -> str:
         due_str = ""
         if t.get("due_date"):
             try:
-                dt = datetime.fromisoformat(t["due_date"]) if isinstance(t["due_date"], str) else t["due_date"]
-                due_str = f" • Hạn: {dt.strftime('%H:%M %d/%m')}"
+                dt = datetime.fromisoformat(t["due_date"].replace("Z", "+00:00"))
+                due_str = dt.strftime("%H:%M • %d/%m")
             except Exception:
-                due_str = f" • Hạn: {t.get('due_date')}"
-
+                due_str = str(t["due_date"])
         return f"""
-        <div class="card" style="border-left: 4px solid {border_color}; margin-bottom: 10px; padding: 12px 16px;">
-          <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px;">
-            <div style="font-weight: 600; font-size: 14px; color: #1e293b;">{t.get('title')}</div>
-            {get_priority_badge(t.get('priority', 'MEDIUM'))}
+        <div class="card" style="border-left: 4px solid {border_color}; padding: 12px 16px; margin-bottom: 10px;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong style="font-size: 14px; color: #1e293b;">{t['title']}</strong>
+            <span style="font-size: 11px; color: #64748b;">📁 {t.get('category', 'General')}</span>
           </div>
-          <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
-            📁 {t.get('category', 'General')}{due_str}
-          </div>
+          {f'<div style="font-size: 12px; color: #64748b; margin-top: 4px;">⏰ {due_str}</div>' if due_str else ''}
         </div>
         """
 
     sections_html = ""
-
     if overdue_tasks:
         cards = "".join([render_task_card(t, "#ef4444") for t in overdue_tasks])
         sections_html += f"""
         <div class="section-title" style="color: #dc2626;">
-          ⚠️ Việc chưa hoàn thành & Quá hạn ({len(overdue_tasks)})
+          🔴 Việc quá hạn cần xử lý gấp ({len(overdue_tasks)})
         </div>
         {cards}
         """
 
     if today_tasks:
-        cards = "".join([render_task_card(t, "#3b82f6") for t in today_tasks])
+        cards = "".join([render_task_card(t, "#6366f1") for t in today_tasks])
         sections_html += f"""
-        <div class="section-title" style="color: #2563eb;">
-          📌 Việc cần làm hôm nay ({len(today_tasks)})
+        <div class="section-title" style="color: #4f46e5;">
+          🔵 Việc cần hoàn thành hôm nay ({len(today_tasks)})
         </div>
         {cards}
         """
@@ -225,23 +256,11 @@ async def send_daily_digest_email(
     """
 
     html_content = get_base_email_html(title, preheader, content_html)
-
-    try:
-        params = {
-            "from": settings.EMAIL_FROM,
-            "to": [to_email],
-            "subject": f"🌅 [Smart Todo] Kế hoạch công việc hôm nay của bạn ({len(overdue_tasks) + len(today_tasks) + len(upcoming_24h_tasks)} việc)",
-            "html": html_content
-        }
-        response = resend.Emails.send(params)
-        logger.info(f"Daily digest email sent to {to_email}: {response}")
-        return {"success": True, "response": response}
-    except Exception as e:
-        logger.error(f"Failed to send daily digest email to {to_email}: {e}")
-        return {"success": False, "error": str(e)}
+    subject = f"🌅 [Smart Todo] Kế hoạch công việc hôm nay của bạn ({len(overdue_tasks) + len(today_tasks) + len(upcoming_24h_tasks)} việc)"
+    return await send_email_async(to_email, subject, html_content)
 
 async def send_test_email(to_email: str, user_name: str) -> Dict[str, Any]:
-    """Send test email to verify Resend setup"""
+    """Send test email to verify email server setup"""
     title = "✅ Kiểm Tra Kết Nối Email Thành Công!"
     preheader = "Hệ thống thông báo Smart Todo Hub đã kết nối thành công với hòm thư của bạn."
     
@@ -251,7 +270,7 @@ async def send_test_email(to_email: str, user_name: str) -> Dict[str, Any]:
       <div style="font-size: 36px; margin-bottom: 8px;">🎉</div>
       <h3 style="margin: 0 0 8px 0; color: #065f46; font-size: 18px;">Kết Nối Email Hoàn Tất!</h3>
       <p style="margin: 0; color: #047857; font-size: 14px;">
-        Hệ thống gửi thông báo tự động qua <strong>Resend API</strong> đã hoạt động hoàn hảo.
+        Hệ thống gửi thông báo tự động đã hoạt động hoàn hảo.
       </p>
     </div>
     <p style="font-size: 14px; color: #475569;">
@@ -260,20 +279,8 @@ async def send_test_email(to_email: str, user_name: str) -> Dict[str, Any]:
     """
     
     html_content = get_base_email_html(title, preheader, content_html)
-    
-    try:
-        params = {
-            "from": settings.EMAIL_FROM,
-            "to": [to_email],
-            "subject": "✅ [Smart Todo] Kiểm tra kết nối gửi email thành công",
-            "html": html_content
-        }
-        response = resend.Emails.send(params)
-        logger.info(f"Test email sent to {to_email}: {response}")
-        return {"success": True, "response": response}
-    except Exception as e:
-        logger.error(f"Failed to send test email to {to_email}: {e}")
-        return {"success": False, "error": str(e)}
+    subject = "✅ [Smart Todo] Kiểm tra kết nối gửi email thành công"
+    return await send_email_async(to_email, subject, html_content)
 
 async def send_otp_registration_email(to_email: str, user_name: str, otp_code: str) -> Dict[str, Any]:
     """Send 6-digit OTP email for new user registration verification (valid for 5 minutes)"""
@@ -302,18 +309,5 @@ async def send_otp_registration_email(to_email: str, user_name: str, otp_code: s
     """
     
     html_content = get_base_email_html("Xác Thực Tài Khoản Smart Todo Hub", preheader, content_html)
-    
-    try:
-        params = {
-            "from": settings.EMAIL_FROM,
-            "to": [to_email],
-            "subject": f"🔐 [Smart Todo] Mã xác thực OTP đăng ký tài khoản ({otp_code})",
-            "html": html_content
-        }
-        response = resend.Emails.send(params)
-        logger.info(f"Registration OTP email sent to {to_email}: {response}")
-        return {"success": True, "response": response}
-    except Exception as e:
-        logger.error(f"Failed to send OTP email to {to_email}: {e}")
-        return {"success": False, "error": str(e)}
-
+    subject = f"🔐 [Smart Todo] Mã xác thực OTP đăng ký tài khoản ({otp_code})"
+    return await send_email_async(to_email, subject, html_content)

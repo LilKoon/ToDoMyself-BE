@@ -35,7 +35,16 @@ class Settings(BaseSettings):
     RESEND_API_KEY: Optional[str] = None
     EMAIL_FROM: str = "Smart Todo App <onboarding@resend.dev>"
 
+    # SMTP Settings (e.g. Gmail App Password, Custom SMTP)
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USER: Optional[str] = None
+    SMTP_PASSWORD: Optional[str] = None
+    SMTP_FROM: Optional[str] = None
+    SMTP_TLS: bool = True
+
     # CORS
+
     CORS_ORIGINS: Union[List[str], str] = ["http://localhost:3000", "http://127.0.0.1:3000", "*"]
 
     @field_validator("CORS_ORIGINS", mode="before")
