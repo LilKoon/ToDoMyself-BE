@@ -47,8 +47,13 @@ async def init_db():
         try:
             from sqlalchemy import text
             await conn.execute(text("ALTER TABLE todos ADD COLUMN IF NOT EXISTS start_date TIMESTAMPTZ;"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_todos_user_status ON todos(user_id, status);"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_todos_user_due_date ON todos(user_id, due_date);"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_todos_user_created_at ON todos(user_id, created_at);"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_todos_scheduler_remind ON todos(is_reminder_sent, status, reminder_time);"))
         except Exception:
             pass
 
-        logger.info("Database tables initialized successfully.")
+        logger.info("Database tables and indexes initialized successfully.")
+
 

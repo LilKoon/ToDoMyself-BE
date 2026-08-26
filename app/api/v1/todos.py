@@ -45,7 +45,9 @@ async def get_todos(
         stmt = stmt.where(
             or_(
                 func.lower(Todo.title).like(search_pattern),
-                func.lower(Todo.description).like(search_pattern)
+                func.lower(Todo.description).like(search_pattern),
+                func.lower(Todo.category).like(search_pattern),
+                Todo.subtasks.any(func.lower(Subtask.title).like(search_pattern))
             )
         )
 
@@ -119,10 +121,12 @@ async def create_todo(
         priority=todo_in.priority,
         status=todo_in.status,
         category=todo_in.category or "General",
+        start_date=todo_in.start_date,
         due_date=todo_in.due_date,
         reminder_time=reminder_time,
         is_reminder_sent=False
     )
+
     db.add(new_todo)
     await db.flush()
 

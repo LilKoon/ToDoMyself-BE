@@ -1,6 +1,6 @@
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Index, Enum as SQLEnum
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -32,9 +32,16 @@ class Todo(Base):
     reminder_time = Column(DateTime(timezone=True), nullable=True)
     is_reminder_sent = Column(Boolean, default=False)
 
-    
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    # Composite Indexes for high-performance querying
+    __table_args__ = (
+        Index("idx_todos_user_status", "user_id", "status"),
+        Index("idx_todos_user_due_date", "user_id", "due_date"),
+        Index("idx_todos_user_created_at", "user_id", "created_at"),
+        Index("idx_todos_scheduler_remind", "is_reminder_sent", "status", "reminder_time"),
+    )
 
     # Relationships
     owner = relationship("User", back_populates="todos")

@@ -1,22 +1,68 @@
 import pytz
 import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy import delete
 
 from app.core.database import AsyncSessionLocal
 from app.models.user import User
 from app.models.todo import Todo, Subtask, StatusEnum
 from app.models.notification import UserNotificationSettings, NotificationLog, NotificationTypeEnum, NotificationStatusEnum
+from app.models.otp import EmailOTP
 from app.services.email_service import send_task_reminder_email, send_daily_digest_email
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
+async def process_single_task_reminder(
+    sem: asyncio.Semaphore,
+    todo: Todo,
+    user: User,
+    now_utc: datetime,
+    db
+):
+    """Worker task to send a single reminder email under concurrency limit"""
+    async with sem:
+        logger.info(f"Triggering email reminder for task '{todo.title}' (User: {user.email})")
+        
+        todo_dict = {
+            "id": todo.id,
+            "title": todo.title,
+            "description": todo.description,
+            "priority": todo.priority.value,
+            "category": todo.category,
+            "due_date": todo.due_date.isoformat() if todo.due_date else None,
+            "subtasks": [{"title": s.title, "is_completed": s.is_completed} for s in todo.subtasks]
+        }
+
+        res = await send_task_reminder_email(
+            to_email=user.email,
+            user_name=user.full_name,
+            todo=todo_dict
+        )
+
+        # Mark as sent to prevent duplicate sending
+        todo.is_reminder_sent = True
+        
+        # Log notification
+        log_entry = NotificationLog(
+            user_id=user.id,
+            todo_id=todo.id,
+            notification_type=NotificationTypeEnum.TASK_REMINDER,
+            status=NotificationStatusEnum.SENT if res.get("success") else NotificationStatusEnum.FAILED,
+            recipient_email=user.email,
+            subject=f"⏰ Nhắc nhở công việc: {todo.title}",
+            error_message=res.get("error") if not res.get("success") else None,
+            sent_at=now_utc
+        )
+        db.add(log_entry)
+
 async def check_and_send_task_reminders():
-    """Job to check individual task reminders every 1 minute"""
+    """Job to check individual task reminders every 1 minute with parallel sending"""
     async with AsyncSessionLocal() as db:
         try:
             now_utc = datetime.now(timezone.utc)
@@ -32,6 +78,9 @@ async def check_and_send_task_reminders():
             )
             result = await db.execute(stmt)
             todos = result.scalars().all()
+
+            tasks_to_execute = []
+            sem = asyncio.Semaphore(10) # Max 10 parallel emails sent simultaneously
 
             for todo in todos:
                 user = todo.owner
@@ -55,41 +104,14 @@ async def check_and_send_task_reminders():
                         should_remind = True
 
                 if should_remind:
-                    logger.info(f"Triggering email reminder for task '{todo.title}' (User: {user.email})")
-                    
-                    todo_dict = {
-                        "id": todo.id,
-                        "title": todo.title,
-                        "description": todo.description,
-                        "priority": todo.priority.value,
-                        "category": todo.category,
-                        "due_date": todo.due_date.isoformat() if todo.due_date else None,
-                        "subtasks": [{"title": s.title, "is_completed": s.is_completed} for s in todo.subtasks]
-                    }
-
-                    res = await send_task_reminder_email(
-                        to_email=user.email,
-                        user_name=user.full_name,
-                        todo=todo_dict
+                    tasks_to_execute.append(
+                        process_single_task_reminder(sem, todo, user, now_utc, db)
                     )
 
-                    # Mark as sent to prevent duplicate sending
-                    todo.is_reminder_sent = True
-                    
-                    # Log notification
-                    log_entry = NotificationLog(
-                        user_id=user.id,
-                        todo_id=todo.id,
-                        notification_type=NotificationTypeEnum.TASK_REMINDER,
-                        status=NotificationStatusEnum.SENT if res.get("success") else NotificationStatusEnum.FAILED,
-                        recipient_email=user.email,
-                        subject=f"⏰ Nhắc nhở công việc: {todo.title}",
-                        error_message=res.get("error") if not res.get("success") else None,
-                        sent_at=now_utc
-                    )
-                    db.add(log_entry)
+            if tasks_to_execute:
+                await asyncio.gather(*tasks_to_execute)
+                await db.commit()
 
-            await db.commit()
         except Exception as e:
             logger.error(f"Error in task reminder job: {e}", exc_info=True)
             await db.rollback()
@@ -121,107 +143,136 @@ async def check_and_send_daily_digests():
                 except Exception:
                     user_tz = pytz.timezone("Asia/Ho_Chi_Minh")
 
-                user_local_now = now_utc.astimezone(user_tz)
-                current_time_str = user_local_now.strftime("%H:%M") # e.g. "08:00"
+                user_now = now_utc.astimezone(user_tz)
+                
+                # Match user's configured daily digest time (hour & minute)
                 scheduled_time_str = settings.daily_summary_time or "08:00"
+                try:
+                    sched_hour, sched_minute = map(int, scheduled_time_str.split(":"))
+                except ValueError:
+                    sched_hour, sched_minute = 8, 0
+
+                if user_now.hour != sched_hour or user_now.minute != sched_minute:
+                    continue
 
                 # Check if already sent today in user's timezone
-                already_sent_today = False
-                if settings.last_daily_digest_sent_at:
-                    last_sent_local = settings.last_daily_digest_sent_at.astimezone(user_tz)
-                    if last_sent_local.date() == user_local_now.date():
-                        already_sent_today = True
+                start_of_user_today = user_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+                
+                stmt_log = select(NotificationLog).where(
+                    NotificationLog.user_id == user.id,
+                    NotificationLog.notification_type == NotificationTypeEnum.DAILY_DIGEST,
+                    NotificationLog.sent_at >= start_of_user_today
+                )
+                res_log = await db.execute(stmt_log)
+                if res_log.scalars().first():
+                    continue  # Already sent today
 
-                # Compare hours and minutes
-                if not already_sent_today and current_time_str == scheduled_time_str:
-                    logger.info(f"Preparing daily digest email for user {user.email} (TZ: {tz_name}, Time: {current_time_str})")
-                    
-                    # Group user tasks according to rules
-                    start_of_today = user_local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-                    end_of_today = user_local_now.replace(hour=23, minute=59, second=59, microsecond=999999)
-                    next_24h = user_local_now + timedelta(hours=24)
+                # Classify user's todos for digest
+                active_todos = [t for t in user.todos if t.status != StatusEnum.COMPLETED]
+                if not active_todos:
+                    continue # Skip if user has no pending tasks
 
-                    overdue_tasks = []
-                    today_tasks = []
-                    upcoming_24h_tasks = []
+                start_of_today_tz = user_now.replace(hour=0, minute=0, second=0, microsecond=0)
+                end_of_today_tz = user_now.replace(hour=23, minute=59, second=59, microsecond=999999)
+                next_48h_tz = user_now + timedelta(hours=48)
 
-                    for t in user.todos:
-                        if t.status == StatusEnum.COMPLETED:
-                            continue
-                        
-                        task_dict = {
-                            "id": t.id,
-                            "title": t.title,
-                            "priority": t.priority.value,
-                            "category": t.category,
-                            "due_date": t.due_date.isoformat() if t.due_date else None
-                        }
+                overdue_tasks = []
+                today_tasks = []
+                upcoming_tasks = []
 
-                        if not t.due_date:
-                            # Tasks with no due date can be listed under today if created recently
-                            today_tasks.append(task_dict)
-                            continue
+                for t in active_todos:
+                    if not t.due_date:
+                        continue
+                    t_due = t.due_date.astimezone(user_tz)
+                    t_dict = {
+                        "id": t.id,
+                        "title": t.title,
+                        "priority": t.priority.value,
+                        "category": t.category,
+                        "due_date": t.due_date.isoformat()
+                    }
+                    if t_due < start_of_today_tz:
+                        overdue_tasks.append(t_dict)
+                    elif start_of_today_tz <= t_due <= end_of_today_tz:
+                        today_tasks.append(t_dict)
+                    elif end_of_today_tz < t_due <= next_48h_tz:
+                        upcoming_tasks.append(t_dict)
 
-                        # Convert task due_date to user timezone
-                        t_due_local = t.due_date.astimezone(user_tz)
+                if not overdue_tasks and not today_tasks and not upcoming_tasks:
+                    continue
 
-                        if t_due_local < start_of_today:
-                            overdue_tasks.append(task_dict)
-                        elif start_of_today <= t_due_local <= end_of_today:
-                            today_tasks.append(task_dict)
-                        elif end_of_today < t_due_local <= next_24h:
-                            upcoming_24h_tasks.append(task_dict)
-                        # Tasks further than 24h / 1 day are purposely NOT sent as per user rule!
+                logger.info(f"Sending daily digest email to {user.email}")
+                res = await send_daily_digest_email(
+                    to_email=user.email,
+                    user_name=user.full_name,
+                    overdue_tasks=overdue_tasks,
+                    today_tasks=today_tasks,
+                    upcoming_tasks=upcoming_tasks
+                )
 
-                    # Send email
-                    res = await send_daily_digest_email(
-                        to_email=user.email,
-                        user_name=user.full_name,
-                        overdue_tasks=overdue_tasks,
-                        today_tasks=today_tasks,
-                        upcoming_24h_tasks=upcoming_24h_tasks
-                    )
-
-                    # Update last sent timestamp
-                    settings.last_daily_digest_sent_at = now_utc
-                    
-                    # Log notification
-                    log_entry = NotificationLog(
-                        user_id=user.id,
-                        notification_type=NotificationTypeEnum.DAILY_DIGEST,
-                        status=NotificationStatusEnum.SENT if res.get("success") else NotificationStatusEnum.FAILED,
-                        recipient_email=user.email,
-                        subject=f"🌅 Kế hoạch công việc hôm nay của bạn",
-                        error_message=res.get("error") if not res.get("success") else None,
-                        sent_at=now_utc
-                    )
-                    db.add(log_entry)
+                log_entry = NotificationLog(
+                    user_id=user.id,
+                    notification_type=NotificationTypeEnum.DAILY_DIGEST,
+                    status=NotificationStatusEnum.SENT if res.get("success") else NotificationStatusEnum.FAILED,
+                    recipient_email=user.email,
+                    subject=f"📋 Tổng hợp công việc ngày {user_now.strftime('%d/%m/%Y')} - Smart Todo Hub",
+                    error_message=res.get("error") if not res.get("success") else None,
+                    sent_at=now_utc
+                )
+                db.add(log_entry)
 
             await db.commit()
         except Exception as e:
-            logger.error(f"Error in daily digest scheduler job: {e}", exc_info=True)
+            logger.error(f"Error in daily digest job: {e}", exc_info=True)
+            await db.rollback()
+
+async def cleanup_expired_otps():
+    """Clean up expired and used OTPs older than 24 hours"""
+    async with AsyncSessionLocal() as db:
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+            await db.execute(delete(EmailOTP).where(EmailOTP.created_at < cutoff))
+            await db.commit()
+            logger.info("Expired OTPs cleanup completed successfully.")
+        except Exception as e:
+            logger.error(f"Error in cleanup_expired_otps job: {e}", exc_info=True)
             await db.rollback()
 
 def start_scheduler():
-    """Start APScheduler with interval jobs"""
+    """Start APScheduler jobs"""
     if not scheduler.running:
+        # Job 1: Check task reminders every 1 minute
         scheduler.add_job(
             check_and_send_task_reminders,
-            trigger=IntervalTrigger(seconds=60),
+            trigger=IntervalTrigger(minutes=1),
             id="task_reminders_job",
+            name="Check and send task reminders",
             replace_existing=True
         )
+
+        # Job 2: Check daily digests every 1 minute
         scheduler.add_job(
             check_and_send_daily_digests,
-            trigger=IntervalTrigger(seconds=60), # Check every 60s for matching minute
+            trigger=IntervalTrigger(minutes=1),
             id="daily_digest_job",
+            name="Check and send daily digests",
             replace_existing=True
         )
+
+        # Job 3: Clean up expired OTPs every 12 hours
+        scheduler.add_job(
+            cleanup_expired_otps,
+            trigger=IntervalTrigger(hours=12),
+            id="cleanup_otps_job",
+            name="Clean up expired OTPs",
+            replace_existing=True
+        )
+
         scheduler.start()
-        logger.info("APScheduler started successfully with task_reminders and daily_digest jobs.")
+        logger.info("APScheduler started with 3 background automation jobs.")
 
 def shutdown_scheduler():
-    """Shutdown APScheduler cleanly"""
+    """Gracefully shutdown APScheduler"""
     if scheduler.running:
-        scheduler.shutdown()
-        logger.info("APScheduler shutdown successfully.")
+        scheduler.shutdown(wait=False)
+        logger.info("APScheduler stopped.")
