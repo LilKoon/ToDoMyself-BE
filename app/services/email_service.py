@@ -232,7 +232,8 @@ async def send_email_async(to_email: str, subject: str, html_content: str) -> Di
 async def send_task_reminder_email(
     to_email: str,
     user_name: str,
-    todo: Dict[str, Any]
+    todo: Dict[str, Any],
+    magic_login_url: str = ""
 ) -> Dict[str, Any]:
     """Send task reminder email before deadline or at scheduled reminder_time"""
     title = f"⏰ Nhắc nhở: {todo['title']}"
@@ -267,6 +268,8 @@ async def send_task_reminder_email(
         </div>
         """
 
+    btn_url = magic_login_url if magic_login_url else f"{settings.FRONTEND_URL}/dashboard"
+
     content_html = f"""
     <p style="font-size: 15px; margin-top: 0;">Xin chào <strong>{user_name}</strong>,</p>
     <p style="font-size: 14px; color: #475569;">Đây là email nhắc nhở tự động từ hệ thống Smart Todo Hub về công việc sắp tới hạn của bạn:</p>
@@ -285,7 +288,12 @@ async def send_task_reminder_email(
     </div>
     
     <div style="text-align: center; margin-top: 24px;">
-      <a href="http://localhost:3000/dashboard" class="btn">Mở Bảng Công Việc Để Cập Nhật</a>
+      <a href="{btn_url}" class="btn" style="background: linear-gradient(135deg, #6366f1, #4f46e5); color: #ffffff; padding: 13px 26px; border-radius: 12px; text-decoration: none; font-weight: 700; font-size: 14px; display: inline-block;">
+        🚀 Mở Bảng Việc (Đăng Nhập Tự Động)
+      </a>
+      <p style="font-size: 11px; color: #94a3b8; margin-top: 8px;">
+        💡 Bấm link trên để vào thẳng Dashboard mà không cần nhập mật khẩu (Hạn dùng 48h)
+      </p>
     </div>
     """
 

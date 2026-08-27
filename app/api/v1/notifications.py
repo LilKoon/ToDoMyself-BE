@@ -90,7 +90,10 @@ async def trigger_test_email(
     db: AsyncSession = Depends(get_db)
 ):
     target_email = req.target_email if (req and req.target_email) else current_user.email
-    res = await send_test_email(to_email=str(target_email), user_name=current_user.full_name)
+    magic_token = create_magic_login_token(subject=current_user.id, email=current_user.email, expires_hours=48)
+    magic_login_url = f"{settings.FRONTEND_URL}/magic-login?token={magic_token}"
+    res = await send_test_email(to_email=str(target_email), user_name=current_user.full_name, magic_login_url=magic_login_url)
+
 
     log_entry = NotificationLog(
         user_id=current_user.id,

@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy import delete
 
 
+from app.core.config import settings as app_settings
 from app.core.database import AsyncSessionLocal
 from app.models.user import User
 from app.models.todo import Todo, Subtask, StatusEnum
@@ -43,11 +44,16 @@ async def process_single_task_reminder(
             "subtasks": [{"title": s.title, "is_completed": s.is_completed} for s in todo.subtasks]
         }
 
+        magic_token = create_magic_login_token(subject=user.id, email=user.email, expires_hours=48)
+        magic_login_url = f"{app_settings.FRONTEND_URL}/magic-login?token={magic_token}"
+
         res = await send_task_reminder_email(
             to_email=user.email,
             user_name=user.full_name,
-            todo=todo_dict
+            todo=todo_dict,
+            magic_login_url=magic_login_url
         )
+
 
         # Mark as sent to prevent duplicate sending
         todo.is_reminder_sent = True
@@ -280,8 +286,9 @@ async def check_and_send_daily_digests(force_user_id: Optional[int] = None) -> L
 
                 # Generate Magic Auto-Login URL (48-hour expiration)
                 magic_token = create_magic_login_token(subject=user.id, email=user.email, expires_hours=48)
-                frontend_base_url = "https://todomyself.vercel.app"
-                magic_login_url = f"{frontend_base_url}/magic-login?token={magic_token}"
+                magic_login_url = f"{app_settings.FRONTEND_URL}/magic-login?token={magic_token}"
+
+
 
                 logger.info(
                     f"Sending daily digest to {user.email} (Overdue: {len(final_overdue)}, "
