@@ -298,9 +298,15 @@ async def send_daily_digest_email(
     user_name: str,
     overdue_tasks: List[Dict[str, Any]],
     today_tasks: List[Dict[str, Any]],
-    upcoming_24h_tasks: List[Dict[str, Any]]
+    upcoming_24h_tasks: List[Dict[str, Any]],
+    flexible_tasks: Optional[List[Dict[str, Any]]] = None,
+    total_remaining_count: int = 0,
+    magic_login_url: str = ""
 ) -> Dict[str, Any]:
-    """Send morning daily digest summary email"""
+    """Send morning daily digest summary email with up to 15 tasks & Magic Link Auto-Login"""
+    flexible_tasks = flexible_tasks or []
+    total_shown = len(overdue_tasks) + len(today_tasks) + len(upcoming_24h_tasks) + len(flexible_tasks)
+    
     title = "🌅 Kế Hoạch Công Việc Trong Ngày"
     preheader = f"Hôm nay bạn có {len(today_tasks)} việc cần làm, {len(overdue_tasks)} việc quá hạn, {len(upcoming_24h_tasks)} việc sắp đến."
 
@@ -312,13 +318,20 @@ async def send_daily_digest_email(
                 due_str = dt.strftime("%H:%M • %d/%m")
             except Exception:
                 due_str = str(t["due_date"])
+        
+        priority_label = t.get("priority", "MEDIUM")
+        priority_badge = f'<span style="font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; background: #f1f5f9; color: #475569;">{priority_label}</span>'
+
         return f"""
-        <div class="card" style="border-left: 4px solid {border_color}; padding: 12px 16px; margin-bottom: 10px;">
+        <div class="card" style="border-left: 4px solid {border_color}; padding: 12px 16px; margin-bottom: 10px; background: #ffffff; border-radius: 8px; border-top: 1px solid #f1f5f9; border-right: 1px solid #f1f5f9; border-bottom: 1px solid #f1f5f9;">
           <div style="display: flex; justify-content: space-between; align-items: center;">
             <strong style="font-size: 14px; color: #1e293b;">{t['title']}</strong>
             <span style="font-size: 11px; color: #64748b;">📁 {t.get('category', 'General')}</span>
           </div>
-          {f'<div style="font-size: 12px; color: #64748b; margin-top: 4px;">⏰ {due_str}</div>' if due_str else ''}
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+            {f'<span style="font-size: 12px; color: #64748b;">⏰ {due_str}</span>' if due_str else '<span style="font-size: 12px; color: #94a3b8;">🕒 Linh hoạt (Không đặt hạn)</span>'}
+            {priority_badge}
+          </div>
         </div>
         """
 
@@ -326,8 +339,8 @@ async def send_daily_digest_email(
     if overdue_tasks:
         cards = "".join([render_task_card(t, "#ef4444") for t in overdue_tasks])
         sections_html += f"""
-        <div class="section-title" style="color: #dc2626;">
-          🔴 Việc quá hạn cần xử lý gấp ({len(overdue_tasks)})
+        <div class="section-title" style="color: #dc2626; font-size: 14px; font-weight: 700; margin: 18px 0 8px 0;">
+          🔴 Việc quá hạn cần xử lý gấp (< 2 ngày) ({len(overdue_tasks)})
         </div>
         {cards}
         """
@@ -335,7 +348,7 @@ async def send_daily_digest_email(
     if today_tasks:
         cards = "".join([render_task_card(t, "#6366f1") for t in today_tasks])
         sections_html += f"""
-        <div class="section-title" style="color: #4f46e5;">
+        <div class="section-title" style="color: #4f46e5; font-size: 14px; font-weight: 700; margin: 18px 0 8px 0;">
           🔵 Việc cần hoàn thành hôm nay ({len(today_tasks)})
         </div>
         {cards}
@@ -344,13 +357,22 @@ async def send_daily_digest_email(
     if upcoming_24h_tasks:
         cards = "".join([render_task_card(t, "#f59e0b") for t in upcoming_24h_tasks])
         sections_html += f"""
-        <div class="section-title" style="color: #d97706;">
+        <div class="section-title" style="color: #d97706; font-size: 14px; font-weight: 700; margin: 18px 0 8px 0;">
           ⏳ Sắp đến hạn trong 24h tới ({len(upcoming_24h_tasks)})
         </div>
         {cards}
         """
 
-    if not (overdue_tasks or today_tasks or upcoming_24h_tasks):
+    if flexible_tasks:
+        cards = "".join([render_task_card(t, "#8b5cf6") for t in flexible_tasks])
+        sections_html += f"""
+        <div class="section-title" style="color: #7c3aed; font-size: 14px; font-weight: 700; margin: 18px 0 8px 0;">
+          📌 Việc linh hoạt cần chú ý ({len(flexible_tasks)})
+        </div>
+        {cards}
+        """
+
+    if total_shown == 0:
         sections_html = """
         <div style="text-align:center; padding: 24px; background:#f0fdf4; border-radius:12px; border: 1px solid #bbf7d0;">
           <p style="font-size: 16px; color: #166534; font-weight:600; margin:0;">🎉 Tuyệt vời! Bạn không có công việc nào tồn đọng hoặc sắp đến hạn.</p>
@@ -358,20 +380,37 @@ async def send_daily_digest_email(
         </div>
         """
 
+    remaining_html = ""
+    if total_remaining_count > 0:
+        remaining_html = f"""
+        <div style="text-align: center; margin: 16px 0; padding: 12px 16px; background: #f8fafc; border-radius: 12px; border: 1px dashed #cbd5e1; color: #64748b; font-size: 13px; font-weight: 600;">
+          ➕ Và còn {total_remaining_count} công việc khác trong bảng việc của bạn...
+        </div>
+        """
+
+    btn_url = magic_login_url if magic_login_url else "https://todomyself.vercel.app/dashboard"
+
     content_html = f"""
     <p style="font-size: 15px; margin-top: 0;">Chào buổi sáng <strong>{user_name}</strong>,</p>
-    <p style="font-size: 14px; color: #475569;">Dưới đây là tổng hợp các công việc cần chú ý của bạn theo thời gian:</p>
+    <p style="font-size: 14px; color: #475569;">Dưới đây là kế hoạch các công việc cần chú ý hôm nay của bạn:</p>
     
     {sections_html}
+    {remaining_html}
     
     <div style="text-align: center; margin-top: 28px;">
-      <a href="http://localhost:3000/dashboard" class="btn">Mở Bảng Công Việc (Todo Dashboard)</a>
+      <a href="{btn_url}" class="btn" style="background: linear-gradient(135deg, #6366f1, #4f46e5); color: #ffffff; padding: 13px 26px; border-radius: 12px; text-decoration: none; font-weight: 700; font-size: 14px; display: inline-block;">
+        🚀 Mở Bảng Việc (Đăng Nhập Tự Động)
+      </a>
+      <p style="font-size: 11px; color: #94a3b8; margin-top: 8px;">
+        💡 Bấm link trên để vào thẳng Dashboard mà không cần nhập mật khẩu (Hạn dùng 48h)
+      </p>
     </div>
     """
 
     html_content = get_base_email_html(title, preheader, content_html)
-    subject = f"🌅 [Smart Todo] Kế hoạch công việc hôm nay của bạn ({len(overdue_tasks) + len(today_tasks) + len(upcoming_24h_tasks)} việc)"
+    subject = f"🌅 [Smart Todo] Kế hoạch công việc hôm nay ({total_shown + total_remaining_count} việc)"
     return await send_email_async(to_email, subject, html_content)
+
 
 async def send_test_email(to_email: str, user_name: str) -> Dict[str, Any]:
     """Send test email to verify email server setup"""

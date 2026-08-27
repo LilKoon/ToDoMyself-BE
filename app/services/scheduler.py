@@ -16,6 +16,7 @@ from app.models.todo import Todo, Subtask, StatusEnum
 from app.models.notification import UserNotificationSettings, NotificationLog, NotificationTypeEnum, NotificationStatusEnum
 from app.models.otp import EmailOTP
 from app.services.email_service import send_task_reminder_email, send_daily_digest_email
+from app.core.security import create_magic_login_token
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
@@ -200,38 +201,103 @@ async def check_and_send_daily_digests(force_user_id: Optional[int] = None) -> L
 
                 start_of_today_tz = user_now.replace(hour=0, minute=0, second=0, microsecond=0)
                 end_of_today_tz = user_now.replace(hour=23, minute=59, second=59, microsecond=999999)
-                next_48h_tz = user_now + timedelta(hours=48)
+                next_24h_tz = user_now + timedelta(hours=24)
+                overdue_cutoff_tz = start_of_today_tz - timedelta(days=2) # Only tasks overdue < 2 days
 
-                overdue_tasks = []
-                today_tasks = []
-                upcoming_24h_tasks = []
+                raw_overdue = []
+                raw_today = []
+                raw_upcoming_24h = []
+                raw_flexible = []
+
+                # Priority score for sorting flexible tasks
+                priority_weights = {"URGENT": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
                 for t in active_todos:
-                    if not t.due_date:
-                        continue
-                    t_due = to_utc(t.due_date).astimezone(user_tz)
                     t_dict = {
                         "id": t.id,
                         "title": t.title,
                         "priority": t.priority.value,
                         "category": t.category,
-                        "due_date": t.due_date.isoformat()
+                        "due_date": t.due_date.isoformat() if t.due_date else None
                     }
 
-                    if t_due < start_of_today_tz:
-                        overdue_tasks.append(t_dict)
-                    elif start_of_today_tz <= t_due <= end_of_today_tz:
-                        today_tasks.append(t_dict)
-                    elif end_of_today_tz < t_due <= next_48h_tz:
-                        upcoming_24h_tasks.append(t_dict)
+                    if not t.due_date:
+                        raw_flexible.append((t_dict, priority_weights.get(t.priority.value, 2)))
+                        continue
 
-                logger.info(f"Sending daily digest email to {user.email} (Overdue: {len(overdue_tasks)}, Today: {len(today_tasks)}, Upcoming: {len(upcoming_24h_tasks)})")
+                    t_due = to_utc(t.due_date).astimezone(user_tz)
+
+                    if overdue_cutoff_tz <= t_due < start_of_today_tz:
+                        raw_overdue.append((t_dict, t_due))
+                    elif start_of_today_tz <= t_due <= end_of_today_tz:
+                        raw_today.append((t_dict, t_due))
+                    elif end_of_today_tz < t_due <= next_24h_tz:
+                        raw_upcoming_24h.append((t_dict, t_due))
+
+                # Sort each category logically
+                raw_overdue.sort(key=lambda x: x[1]) # Oldest due date first
+                raw_today.sort(key=lambda x: x[1]) # Earliest in day first
+                raw_upcoming_24h.sort(key=lambda x: x[1])
+                raw_flexible.sort(key=lambda x: x[1], reverse=True) # Highest priority first
+
+                sorted_overdue = [x[0] for x in raw_overdue]
+                sorted_today = [x[0] for x in raw_today]
+                sorted_upcoming = [x[0] for x in raw_upcoming_24h]
+                sorted_flexible = [x[0] for x in raw_flexible]
+
+                total_in_scope = len(sorted_overdue) + len(sorted_today) + len(sorted_upcoming) + len(sorted_flexible)
+                MAX_TASKS = 15
+
+                # Pick up to MAX_TASKS in strict order: Overdue -> Today -> Upcoming -> Flexible
+                final_overdue = []
+                final_today = []
+                final_upcoming = []
+                final_flexible = []
+
+                budget = MAX_TASKS
+
+                for t in sorted_overdue:
+                    if budget > 0:
+                        final_overdue.append(t)
+                        budget -= 1
+
+                for t in sorted_today:
+                    if budget > 0:
+                        final_today.append(t)
+                        budget -= 1
+
+                for t in sorted_upcoming:
+                    if budget > 0:
+                        final_upcoming.append(t)
+                        budget -= 1
+
+                for t in sorted_flexible:
+                    if budget > 0:
+                        final_flexible.append(t)
+                        budget -= 1
+
+                total_remaining = max(0, total_in_scope - MAX_TASKS)
+
+                # Generate Magic Auto-Login URL (48-hour expiration)
+                magic_token = create_magic_login_token(subject=user.id, email=user.email, expires_hours=48)
+                frontend_base_url = "https://todomyself.vercel.app"
+                magic_login_url = f"{frontend_base_url}/magic-login?token={magic_token}"
+
+                logger.info(
+                    f"Sending daily digest to {user.email} (Overdue: {len(final_overdue)}, "
+                    f"Today: {len(final_today)}, Upcoming: {len(final_upcoming)}, "
+                    f"Flexible: {len(final_flexible)}, Remaining: {total_remaining})"
+                )
+
                 res = await send_daily_digest_email(
                     to_email=user.email,
                     user_name=user.full_name,
-                    overdue_tasks=overdue_tasks,
-                    today_tasks=today_tasks,
-                    upcoming_24h_tasks=upcoming_24h_tasks
+                    overdue_tasks=final_overdue,
+                    today_tasks=final_today,
+                    upcoming_24h_tasks=final_upcoming,
+                    flexible_tasks=final_flexible,
+                    total_remaining_count=total_remaining,
+                    magic_login_url=magic_login_url
                 )
 
                 log_entry = NotificationLog(
@@ -248,6 +314,7 @@ async def check_and_send_daily_digests(force_user_id: Optional[int] = None) -> L
 
             await db.commit()
             return results
+
         except Exception as e:
             logger.error(f"Error in daily digest job: {e}", exc_info=True)
             await db.rollback()

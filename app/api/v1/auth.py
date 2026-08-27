@@ -15,6 +15,8 @@ from app.core.security import (
     create_setup_token,
     verify_setup_token,
     verify_google_token,
+    create_magic_login_token,
+    verify_magic_login_token,
     get_current_user
 )
 from app.models.user import User
@@ -22,7 +24,7 @@ from app.models.notification import UserNotificationSettings
 from app.models.otp import EmailOTP
 from app.schemas.user import (
     UserCreate, UserLogin, GoogleAuthRequest, SetPasswordRequest,
-    UserUpdate, UserOut, TokenResponse, RefreshTokenRequest
+    UserUpdate, UserOut, TokenResponse, RefreshTokenRequest, MagicLoginRequest
 )
 from app.schemas.otp import SendOTPRequest, VerifyOTPRequest, ResendOTPRequest, OTPResponse
 from app.services.email_service import send_otp_registration_email
@@ -473,3 +475,40 @@ async def update_me(
     await db.commit()
     await db.refresh(current_user)
     return current_user
+
+@router.post("/magic-login", response_model=TokenResponse)
+async def magic_login(req: MagicLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Authenticate user directly from an email Magic Link token"""
+    payload = verify_magic_login_token(req.token)
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Magic Link đã hết hạn hoặc không hợp lệ. Vui lòng đăng nhập bình thường."
+        )
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token không hợp lệ."
+        )
+
+    result = await db.execute(select(User).where(User.id == int(user_id)))
+    user = result.scalars().first()
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Người dùng không tồn tại.")
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tài khoản đã bị vô hiệu hóa.")
+
+    access_token = create_access_token(user.id)
+    refresh_token = create_refresh_token(user.id)
+
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=refresh_token,
+        needs_password_setup=not user.has_password,
+        user=UserOut.model_validate(user),
+        message="Đăng nhập tự động thành công qua Magic Link."
+    )
+
