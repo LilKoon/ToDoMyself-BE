@@ -107,7 +107,32 @@ async def trigger_test_email(
     if not res.get("success"):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi khi gửi email qua Resend: {res.get('error')}"
+            detail=f"Lỗi khi gửi email: {res.get('error')}"
         )
 
     return {"message": f"Email thử nghiệm đã được gửi thành công đến {target_email}!"}
+
+@router.post("/test-daily-digest")
+async def trigger_test_daily_digest(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Trigger sending daily digest email immediately for current user"""
+    from app.services.scheduler import check_and_send_daily_digests
+    results = await check_and_send_daily_digests(force_user_id=current_user.id)
+    
+    if not results:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Không thể tạo hoặc gửi email tổng hợp công việc."
+        )
+        
+    first_res = results[0].get("result", {})
+    if not first_res.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Lỗi khi gửi email tổng hợp: {first_res.get('error')}"
+        )
+
+    return {"message": f"Email tổng hợp công việc (Daily Digest) đã được gửi thành công đến {current_user.email}!"}
+

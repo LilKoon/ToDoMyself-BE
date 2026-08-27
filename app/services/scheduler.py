@@ -2,7 +2,7 @@ import pytz
 import logging
 import asyncio
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.future import select
@@ -19,6 +19,7 @@ from app.services.email_service import send_task_reminder_email, send_daily_dige
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
+
 
 async def process_single_task_reminder(
     sem: asyncio.Semaphore,
@@ -129,8 +130,9 @@ async def check_and_send_task_reminders():
             logger.error(f"Error in task reminder job: {e}", exc_info=True)
             await db.rollback()
 
-async def check_and_send_daily_digests():
-    """Job to check daily digest for each user based on their custom timezone and scheduled time"""
+async def check_and_send_daily_digests(force_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Job to check daily digest for each user based on their custom timezone and scheduled time (with Smart Catch-up)"""
+    results = []
     async with AsyncSessionLocal() as db:
         try:
             now_utc = datetime.now(timezone.utc)
@@ -141,13 +143,21 @@ async def check_and_send_daily_digests():
                 .options(selectinload(User.notification_settings), selectinload(User.todos))
                 .where(User.is_active == True)
             )
+            if force_user_id:
+                stmt = stmt.where(User.id == force_user_id)
+
             result = await db.execute(stmt)
             users = result.scalars().all()
 
             for user in users:
                 settings = user.notification_settings
-                if not settings or not settings.email_notifications_enabled or not settings.daily_summary_enabled:
+                if not settings:
                     continue
+
+                # If running automatically (not manually forced), check user's toggles
+                if not force_user_id:
+                    if not settings.email_notifications_enabled or not settings.daily_summary_enabled:
+                        continue
 
                 # Parse user timezone
                 tz_name = user.timezone or "Asia/Ho_Chi_Minh"
@@ -165,25 +175,28 @@ async def check_and_send_daily_digests():
                 except ValueError:
                     sched_hour, sched_minute = 8, 0
 
-                if user_now.hour != sched_hour or user_now.minute != sched_minute:
+                sched_time_obj = time(sched_hour, sched_minute)
+
+                # If automatic, only send if current user time has reached or passed scheduled time today
+                if not force_user_id and user_now.time() < sched_time_obj:
                     continue
 
-                # Check if already sent today in user's timezone
+                # Check if already sent successfully today in user's timezone
                 start_of_user_today = user_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
                 
-                stmt_log = select(NotificationLog).where(
-                    NotificationLog.user_id == user.id,
-                    NotificationLog.notification_type == NotificationTypeEnum.DAILY_DIGEST,
-                    NotificationLog.sent_at >= start_of_user_today
-                )
-                res_log = await db.execute(stmt_log)
-                if res_log.scalars().first():
-                    continue  # Already sent today
+                if not force_user_id:
+                    stmt_log = select(NotificationLog).where(
+                        NotificationLog.user_id == user.id,
+                        NotificationLog.notification_type == NotificationTypeEnum.DAILY_DIGEST,
+                        NotificationLog.status == NotificationStatusEnum.SENT,
+                        NotificationLog.sent_at >= start_of_user_today
+                    )
+                    res_log = await db.execute(stmt_log)
+                    if res_log.scalars().first():
+                        continue  # Already sent successfully today
 
                 # Classify user's todos for digest
                 active_todos = [t for t in user.todos if t.status != StatusEnum.COMPLETED]
-                if not active_todos:
-                    continue # Skip if user has no pending tasks
 
                 start_of_today_tz = user_now.replace(hour=0, minute=0, second=0, microsecond=0)
                 end_of_today_tz = user_now.replace(hour=23, minute=59, second=59, microsecond=999999)
@@ -191,7 +204,7 @@ async def check_and_send_daily_digests():
 
                 overdue_tasks = []
                 today_tasks = []
-                upcoming_tasks = []
+                upcoming_24h_tasks = []
 
                 for t in active_todos:
                     if not t.due_date:
@@ -210,18 +223,15 @@ async def check_and_send_daily_digests():
                     elif start_of_today_tz <= t_due <= end_of_today_tz:
                         today_tasks.append(t_dict)
                     elif end_of_today_tz < t_due <= next_48h_tz:
-                        upcoming_tasks.append(t_dict)
+                        upcoming_24h_tasks.append(t_dict)
 
-                if not overdue_tasks and not today_tasks and not upcoming_tasks:
-                    continue
-
-                logger.info(f"Sending daily digest email to {user.email}")
+                logger.info(f"Sending daily digest email to {user.email} (Overdue: {len(overdue_tasks)}, Today: {len(today_tasks)}, Upcoming: {len(upcoming_24h_tasks)})")
                 res = await send_daily_digest_email(
                     to_email=user.email,
                     user_name=user.full_name,
                     overdue_tasks=overdue_tasks,
                     today_tasks=today_tasks,
-                    upcoming_tasks=upcoming_tasks
+                    upcoming_24h_tasks=upcoming_24h_tasks
                 )
 
                 log_entry = NotificationLog(
@@ -234,11 +244,15 @@ async def check_and_send_daily_digests():
                     sent_at=now_utc
                 )
                 db.add(log_entry)
+                results.append({"user_id": user.id, "email": user.email, "result": res})
 
             await db.commit()
+            return results
         except Exception as e:
             logger.error(f"Error in daily digest job: {e}", exc_info=True)
             await db.rollback()
+            return results
+
 
 async def cleanup_expired_otps():
     """Clean up expired and used OTPs older than 24 hours"""
